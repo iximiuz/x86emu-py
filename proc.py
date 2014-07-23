@@ -17,7 +17,7 @@ def mod_byte_get_r_m(word):
 
 def bytes_to_int(bytes):
     acc = 0
-    for b, i in enumerate(bytes):
+    for i, b in enumerate(bytes):
         acc |= b << (i << 3)
 
     return acc
@@ -37,6 +37,22 @@ class Proc86:
     bx = 0  # base, accumulator
     cx = 0  # counter, accumulator
     dx = 0  # accumulator, other functions
+
+    @property
+    def al(self):
+        return self.ax & 0x00FF
+
+    @al.setter
+    def al(self, value):
+        self.ax = (self.ax & 0xFF00) | (value & 0xFF)
+
+    @property
+    def ah(self):
+        return (self.ax & 0xFF00) >> 8
+
+    @al.setter
+    def ah(self, value):
+        self.ax = (self.ax & 0x00FF) | ((value & 0xFF) << 8)
 
     # index registers
     si = 0  # Source Index
@@ -123,8 +139,10 @@ class Alu:
         self.cpu = None
 
         self.micro_codes = {
-            'cmp': self._cmp,
-            'js': self._js
+            'cmp': self.cmp,
+            'dec': self.dec,
+            'js': self.js,
+            'mov': self.mov
         }
 
     def init(self, cpu):
@@ -135,20 +153,33 @@ class Alu:
         if not method:
             raise Exception('Unexpected micro program [' + self.cpu.cir + ']')
 
-        method(self.cpu.cir.operands)
+        method(self.cpu.cir)
 
-    def _cmp(self, operands):
-        temp = operands[0] - operands[1]
+    def cmp(self, instr):
+        temp = instr.operands[0] - instr.operands[1]
 
-        self.cpu.reset_flags()
+        self.cpu.reset_flags() # todo: reset only desired flags! o..szapc
         self.cpu.set_sign_flag(temp)
         self.cpu.set_zero_flag(temp)
         self.cpu.set_parity_flag(temp)
 
+    def dec(self, instr):
+        old = getattr(self.cpu, instr.operands[0])
+        setattr(self.cpu, instr.operands[0], (old - 1) % (1 << self.cpu.word_size_bits))
+
+        self.cpu.reset_flags() # todo: reset only desired flags! o..szapc
+        #self.cpu.set_sign_flag(new)
+        #self.cpu.set_zero_flag(new)
+        #self.cpu.set_parity_flag(new)
+
     # Jump short if zero/equal (ZF=0)
-    def _js(self, operands):
+    def js(self, instr):
         if self.cpu.test_zero_flag():
-            self.cpu.ip += operands[0]
+            self.cpu.ip += instr.operands[0]
+
+    def mov(self, instr):
+        setattr(self.cpu, instr.operands[0], instr.operands[1])
+
 
 class InstructionDecoder:  # aka Control Unit (CU)
     def __init__(self, ):
@@ -156,8 +187,12 @@ class InstructionDecoder:  # aka Control Unit (CU)
         self.memory = None
 
         self.opcodes = {
+            0x4B: self._decode_dec_Zv,
+            0x74: self._decode_js_Jbs,
             0x81: self._decode0x81,
-            0x74: self._decode_js_Jbs
+            0xB0: self._decode_mov_Zb_Ib,
+            0xBB: self._decode_mov_Zv_Iv,
+            0xBC: self._decode_mov_Zv_Iv
         }
 
         self.opcodes_ext = {
@@ -167,7 +202,7 @@ class InstructionDecoder:  # aka Control Unit (CU)
         }
 
         # only for 16-bit CPU
-        self.mod_rm_byte_reg = {
+        self.reg_code = {
             0b000: 'ax',
             0b001: 'cx',
             0b010: 'dx',
@@ -176,6 +211,17 @@ class InstructionDecoder:  # aka Control Unit (CU)
             0b101: 'bp',
             0b110: 'si',
             0b111: 'di'
+        }
+
+        self.half_reg_code = {
+            0b000: 'al',
+            0b001: 'cl',
+            0b010: 'dl',
+            0b011: 'bl',
+            0b100: 'ah',
+            0b101: 'ch',
+            0b110: 'dh',
+            0b111: 'bh'
         }
 
     def init(self, cpu, memory):
@@ -208,9 +254,31 @@ class InstructionDecoder:  # aka Control Unit (CU)
         r_value = self.cpu.mdr
         self.cpu.ip += len(word) + len(r_value)
 
-        l_value = getattr(self.cpu, self.mod_rm_byte_reg[mod_byte_get_r_m(word)])
+        l_value = getattr(self.cpu, self.reg_code[mod_byte_get_r_m(word)])
 
         return Instr('cmp', [l_value, bytes_to_int(r_value)])
+
+    # see _decode_mov_Zv_Iv
+    def _decode_mov_Zb_Ib(self, word):
+        self.cpu.ip += len(word)
+
+        return Instr('mov', [self.half_reg_code[word[0] & 0b00000111], int(word[1])])
+
+
+    # Register code, from 0 through 7, added to the basic value of the Primary Opcode.
+    # The instruction has no ModR/M byte; the three least-significant bits of the opcode
+    # byte selects a general-purpose register.
+    # Z (alias for +r) - The instruction has no ModR/M byte; the three least-significant
+    # bits of the opcode byte selects a general-purpose register.
+    # I - means immediate memory arg (v - word or dword).
+    def _decode_mov_Zv_Iv(self, word):
+        self.cpu.mar = self.cpu.ip + 1 # 1 byte opcode
+        self.cpu.fetch_mem()
+
+        i_value = self.cpu.mdr
+        self.cpu.ip += 1 + len(i_value)
+
+        return Instr('mov', [self.reg_code[word[0] & 0b00000111], bytes_to_int(i_value)])
 
     # J  - The instruction contains a relative offset to be added to the instruction pointer register
     # bs - Byte, sign-extended to the size of the destination operand.
@@ -218,3 +286,8 @@ class InstructionDecoder:  # aka Control Unit (CU)
         self.cpu.ip += len(word)
 
         return Instr('js', [int(word[1])])
+
+    def _decode_dec_Zv(self, word):
+        self.cpu.ip += 1 # 1 byte opcode
+
+        return Instr('dec', [self.reg_code[word[0] & 0b00000111]])
